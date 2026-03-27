@@ -1,0 +1,703 @@
+{
+# 依赖检测与自动安装
+_install_pkg() {
+    # $1=命令名 $2=apt包名 $3=yum/dnf包名
+    local cmd="$1" apt_pkg="$2" rpm_pkg="$3"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get install -y -q "$apt_pkg"
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q "$rpm_pkg"
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q "$rpm_pkg"
+    else
+        echo "错误：无法识别包管理器，请手动安装 $cmd"; exit 1
+    fi
+}
+# 格式: "命令|apt包名|yum/dnf包名"
+_DEPS="curl|curl|curl
+tmux|tmux|tmux
+free|procps|procps-ng
+ps|procps|procps-ng
+ip|iproute2|iproute
+tput|ncurses-bin|ncurses
+nano|nano|nano"
+while IFS='|' read -r _cmd _apt _rpm; do
+    [ -z "$_cmd" ] && continue
+    if ! command -v "$_cmd" >/dev/null 2>&1; then
+        echo "检测到 $_cmd 未安装，正在安装..."
+        _install_pkg "$_cmd" "$_apt" "$_rpm"
+        echo "$_cmd 安装完成"
+    else
+        echo "$_cmd 已安装，跳过"
+    fi
+done <<< "$_DEPS"
+unset _cmd _apt _rpm _DEPS _install_pkg
+
+cat << 'EOF' > /usr/local/bin/nano-mon
+#!/bin/bash
+# 隐藏光标，绝对禁绝换行
+printf "\033[?25l\033[?7l"
+trap 'printf "\033[?25h\033[?7h\033[0m\033[2J\033[H"; exit' INT TERM EXIT
+
+# UTF-8 编码检查
+if [[ "$LANG$LC_ALL$LC_CTYPE" != *UTF-8* ]] && [[ "$LANG$LC_ALL$LC_CTYPE" != *utf8* ]]; then
+    printf "\033[?25h\033[?7h\033[0m\n警告：终端编码非 UTF-8，进度条等字符可能显示乱码。\n建议执行：export LANG=en_US.UTF-8\n按 Enter 继续..."
+    read -r -t 5
+fi
+
+# ⚡️ 监听窗口拖拽信号
+RESIZE_EVENT=0
+trap 'RESIZE_EVENT=1' WINCH
+
+# 强力清场：开局直接干掉所有历史乱码文件
+rm -f /tmp/.nano_mon_ip /tmp/.nano_mon_last_ip_fetch /tmp/.nano_mon_ip.tmp
+
+IFACE=$(ip route 2>/dev/null | grep default | awk '{print $5}' | head -n1)
+[ -z "$IFACE" ] && IFACE=$(ip link show 2>/dev/null | awk -F': ' '/^[0-9]+: (e|w)/{print $2; exit}')
+[ -z "$IFACE" ] && { printf "\033[?25h\033[?7h\033[0m\n错误：无法检测到网卡，请检查网络配置。\n"; exit 1; }
+
+OS_INFO=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 | sed 's/ GNU\/Linux//g' | sed 's/ (.*)//g')
+[ -z "$OS_INFO" ] && OS_INFO="Linux"
+
+RX_PREV=$(cat /sys/class/net/$IFACE/statistics/rx_bytes 2>/dev/null || echo 0)
+TX_PREV=$(cat /sys/class/net/$IFACE/statistics/tx_bytes 2>/dev/null || echo 0)
+read cpu user nice system idle iowait irq softirq steal _ < /proc/stat
+PREV_IDLE=$((idle + iowait))
+PREV_TOTAL=$((user + nice + system + idle + iowait + irq + softirq + steal))
+
+CORES=$(nproc 2>/dev/null || echo 1)
+# ⚡️ 仅修改此处：精简 CPU 型号逻辑 (脱水版)
+CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed -r -e 's/\((R|TM)\)//g' -e 's/ [0-9]+-Core//' -e 's/ (Xeon|Gold|Platinum|Silver|Bronze|Scalable|Processor|CPU)//g' -e 's/ v[0-9]//g' -e 's/ @.*//g' -e 's/  */ /g' -e 's/^[ \t]*//' || echo "Unknown")
+
+DISK_DEV=$(awk '$3 ~ /^[hsv]d[a-z]$|^nvme[0-9]n[0-9]$/ {print $3; exit}' /proc/partitions)
+[ -n "$DISK_DEV" ] && read PREV_R_SEC PREV_W_SEC <<< $(awk -v dev="$DISK_DEV" '$3==dev {print $6, $10}' /proc/diskstats)
+PREV_R_SEC=${PREV_R_SEC:-0}
+PREV_W_SEC=${PREV_W_SEC:-0}
+
+draw_bar() {
+    awk -v p="$1" -v w="$2" 'BEGIN{
+        if(p>100) p=100; if(p<0) p=0;
+        slices = int((p * w * 8 / 100) + 0.5);
+        if(p>0 && slices==0) slices=1; 
+        
+        full = int(slices / 8);
+        rem = slices % 8;
+        empty = w - full - (rem>0 ? 1 : 0);
+        
+        if(p>80) color="\033[31m"; else if(p>50) color="\033[33m"; else color="\033[32m";
+        printf color;
+        for(i=0; i<full; i++) printf "█";
+        
+        if(rem==1) printf "▏"; else if(rem==2) printf "▎"; else if(rem==3) printf "▍"; 
+        else if(rem==4) printf "▌"; else if(rem==5) printf "▋"; else if(rem==6) printf "▊"; 
+        else if(rem==7) printf "▉";
+        
+        printf "\033[37m";
+        for(i=0; i<empty; i++) printf "░";
+        printf "\033[0m";
+    }'
+}
+
+while true; do
+    # --- 1. 后台数据异步采集区 ---
+    NOW=$(date +%s)
+    LAST_FETCH=$(cat /tmp/.nano_mon_last_ip_fetch 2>/dev/null || echo 0)
+    if [ $((NOW - LAST_FETCH)) -gt 300 ]; then
+        echo $NOW > /tmp/.nano_mon_last_ip_fetch
+        (
+            if ! command -v curl >/dev/null 2>&1; then
+                echo "curl未安装|无|未知|未知|未知" > /tmp/.nano_mon_ip
+                exit 0
+            fi
+            V4=$(curl -s -4 -m 3 ifconfig.me || curl -s -4 -m 3 ip.sb || echo "无")
+            [ -z "$V4" ] && V4="无"
+            V6=$(curl -s -6 -m 3 ifconfig.me || curl -s -6 -m 3 ip.sb || echo "无")
+            [ -z "$V6" ] && V6="无"
+            DNS=$(grep -i '^nameserver' /etc/resolv.conf | head -n1 | awk '{print $2}')
+            [ -z "$DNS" ] && DNS="未知"
+            GEO_DATA=$(curl -s -m 3 "http://ip-api.com/line/?lang=zh-CN&fields=country,regionName,isp" || echo -e "未知\n未知\n未知")
+            C_COUNTRY=$(echo "$GEO_DATA" | sed -n '1p')
+            C_REGION=$(echo "$GEO_DATA" | sed -n '2p')
+            C_ISP=$(echo "$GEO_DATA" | sed -n '3p')
+            [ -z "$C_COUNTRY" ] && C_COUNTRY="未知"
+            if [ "$C_COUNTRY" = "$C_REGION" ] || [ -z "$C_REGION" ]; then
+                CITY="$C_COUNTRY"
+            else
+                CITY="${C_COUNTRY} ${C_REGION}"
+            fi
+            ORG="${C_ISP:-未知}"
+            echo "${V4}|${V6}|${DNS}|${CITY}|${ORG}" > /tmp/.nano_mon_ip.tmp
+            mv /tmp/.nano_mon_ip.tmp /tmp/.nano_mon_ip
+        ) &
+    fi
+
+    if [ -f "/tmp/.nano_mon_ip" ]; then
+        IFS='|' read -r IPV4 IPV6 IP_DNS IP_CITY IP_ORG < /tmp/.nano_mon_ip
+    else
+        IPV4="探测中..."; IPV6="探测中..."; IP_DNS="..."; IP_CITY="..."; IP_ORG="..."
+    fi
+    
+    CURRENT_TIME=$(date +"%m-%d %H:%M:%S %Z")
+    SECS=$(cut -d. -f1 /proc/uptime)
+    D=$((SECS / 86400)); H=$(((SECS % 86400) / 3600)); M=$(((SECS % 3600) / 60))
+    read LOAD1 LOAD5 LOAD15 _ < /proc/loadavg
+    
+    read cpu user nice system idle iowait irq softirq steal _ < /proc/stat
+    IDLE=$((idle + iowait))
+    TOTAL=$((user + nice + system + idle + iowait + irq + softirq + steal))
+    DIFF_IDLE=$((IDLE - PREV_IDLE)); DIFF_TOTAL=$((TOTAL - PREV_TOTAL))
+    CPU_USE=$(awk -v id="$DIFF_IDLE" -v tot="$DIFF_TOTAL" 'BEGIN{if(tot==0) printf "0.0"; else printf "%.1f", 100*(tot-id)/tot}')
+    PREV_IDLE=$IDLE; PREV_TOTAL=$TOTAL
+    
+    read total used <<< $(free -m | awk 'NR==2{print $2, $3}')
+    MEM_TOT=$(awk -v t="$total" 'BEGIN{if(t>=1024) printf "%.1fG", t/1024; else printf "%dM", t}')
+    MEM_USED=$(awk -v u="$used" 'BEGIN{if(u>=1024) printf "%.1fG", u/1024; else printf "%dM", u}')
+    MEM_PCT=$(awk -v u="$used" -v t="$total" 'BEGIN{if(t>0) printf "%.1f", u*100/t; else print "0.0"}')
+    MEM_STR="${MEM_USED} / ${MEM_TOT}"
+    
+    read d_total d_used <<< $(df -k / | awk 'NR==2{print $2, $3}')
+    DISK_TOT=$(awk -v t="$d_total" 'BEGIN{if(t>=1048576) printf "%.1fG", t/1048576; else printf "%dM", t/1024}')
+    DISK_USED=$(awk -v u="$d_used" 'BEGIN{if(u>=1048576) printf "%.1fG", u/1048576; else printf "%dM", u/1024}')
+    DISK_PCT=$(awk -v u="$d_used" -v t="$d_total" 'BEGIN{if(t>0) printf "%.1f", u*100/t; else print "0.0"}')
+    DISK_STR="${DISK_USED} / ${DISK_TOT}"
+    
+    if [ -n "$DISK_DEV" ]; then
+        read r_sec w_sec <<< $(awk -v dev="$DISK_DEV" '$3==dev {print $6, $10}' /proc/diskstats)
+        r_sec=${r_sec:-$PREV_R_SEC}; w_sec=${w_sec:-$PREV_W_SEC}
+        R_BPS=$(awk -v r="$r_sec" -v rp="$PREV_R_SEC" 'BEGIN{printf "%.0f", (r-rp)*512/2}')
+        W_BPS=$(awk -v w="$w_sec" -v wp="$PREV_W_SEC" 'BEGIN{printf "%.0f", (w-wp)*512/2}')
+        PREV_R_SEC=$r_sec; PREV_W_SEC=$w_sec
+        read D_R_S D_W_S <<< $(awk -v r="$R_BPS" -v w="$W_BPS" '
+        function short_fmt(b) {
+            if(b>=1073741824) return sprintf("%.1fG", b/1073741824);
+            else if(b>=1048576) return sprintf("%.1fM", b/1048576);
+            else if(b>=1024) return sprintf("%.1fK", b/1024);
+            else return sprintf("%.0fB", b);
+        }
+        BEGIN{printf "%s/s %s/s", short_fmt(r), short_fmt(w)}')
+    else
+        D_R_S="0B/s"; D_W_S="0B/s"
+    fi
+    
+    RX=$(cat /sys/class/net/$IFACE/statistics/rx_bytes 2>/dev/null || echo 0)
+    TX=$(cat /sys/class/net/$IFACE/statistics/tx_bytes 2>/dev/null || echo 0)
+    read RX_S TX_S RX_TOT TX_TOT <<< $(awk -v r="$RX" -v rp="$RX_PREV" -v t="$TX" -v tp="$TX_PREV" '
+    function short_fmt(b) {
+        if(b>=1099511627776) return sprintf("%.2fT", b/1099511627776);
+        else if(b>=1073741824) return sprintf("%.1fG", b/1073741824);
+        else if(b>=1048576) return sprintf("%.1fM", b/1048576);
+        else if(b>=1024) return sprintf("%.1fK", b/1024);
+        else return sprintf("%.0fB", b);
+    }
+    BEGIN {
+        rb=(r-rp)/2; if(rb<0) rb=0;
+        tb=(t-tp)/2; if(tb<0) tb=0;
+        printf "%s/s %s/s %s %s", short_fmt(rb), short_fmt(tb), short_fmt(r), short_fmt(t)
+    }')
+    RX_PREV=$RX; TX_PREV=$TX
+
+    COLOR_TERM_HIGH="\033[38;2;238;0;100m"
+    COLOR_RESET="\033[0m"
+    SAFE_IPV4="$IPV4"; SAFE_IPV6="$IPV6"; SAFE_DNS="$IP_DNS"
+
+    RAW_PROCS=$(ps -eo pmem,pcpu,comm --sort=-pcpu | awk 'NR>1 {print $1, $2, $3}' | head -n 3)
+
+    # ⚡️ 检测是否在 Tmux 环境中 ⚡️
+    IN_TMUX=0
+    [ -n "$TMUX" ] && [ -n "$TMUX_PANE" ] && command -v tmux >/dev/null 2>&1 && IN_TMUX=1
+
+    # --- 2. 核心渲染与绿线控制区 ---
+    if [ "$IN_TMUX" -eq 1 ]; then
+        GLOBAL_WIDTH=$(tmux display-message -p '#{window_width}' 2>/dev/null || echo 80)
+        CUR_PANE_W=$(tmux display-message -p '#{pane_width}' 2>/dev/null || echo 30)
+    else
+        GLOBAL_WIDTH=$(tput cols 2>/dev/null || echo 80)
+        CUR_PANE_W=$GLOBAL_WIDTH
+    fi
+
+    if [ "$GLOBAL_WIDTH" -lt 70 ]; then
+        # ==========================================
+        # 📱 移动端精简模式 (总宽 < 70)
+        # ==========================================
+        BAR_WIDTH=$((CUR_PANE_W - 14))
+        [ "$BAR_WIDTH" -gt 30 ] && BAR_WIDTH=30 
+        [ "$BAR_WIDTH" -lt 5 ] && BAR_WIDTH=5
+        
+        POS="\033[2K\r"
+        
+        BAR_CPU=$(draw_bar "$CPU_USE" "$BAR_WIDTH")
+        BAR_MEM=$(draw_bar "$MEM_PCT" "$BAR_WIDTH")
+        BAR_DISK=$(draw_bar "$DISK_PCT" "$BAR_WIDTH")
+        TOP_PROCS=$(echo "$RAW_PROCS" | awk '{printf "\033[2K\r %-5.1f  %-5.1f  %.11s\n", $1, $2, $3}')
+        
+        BUFFER=$(
+            printf "\033[H"
+            printf "${POS}\033[1;37;44m 系统信息 \033[K\033[0m\n"
+            printf "${POS} OS: %.22s\n" "$OS_INFO"
+            printf "${POS} 时间: %s\n" "$CURRENT_TIME"
+            printf "${POS} 运行: %s天 %s时 %s分\n" "$D" "$H" "$M"
+            printf "${POS} 负载: %s %s %s\n" "$LOAD1" "$LOAD5" "$LOAD15"
+            printf "${POS} CPU : %s核 %.16s\n" "$CORES" "$CPU_MODEL"
+            printf "${POS} %s %5s%%\n" "$BAR_CPU" "${CPU_USE}"
+            printf "${POS} 内存: %-12s\n" "$MEM_STR"
+            printf "${POS} %s %5s%%\n" "$BAR_MEM" "${MEM_PCT}"
+            printf "${POS} 磁盘: %-12s\n" "$DISK_STR"
+            printf "${POS} %s %5s%%\n" "$BAR_DISK" "${DISK_PCT}"
+            printf "${POS} 读: %-8s| 写: %-8s\n" "$D_R_S" "$D_W_S"
+            printf "${POS}\n"
+            
+            printf "${POS}\033[1;37;44m 进程信息 \033[K\033[0m\n"
+            printf "%s\n" "$TOP_PROCS"
+            printf "${POS}\n"
+            
+            printf "${POS}\033[1;37;44m 网络 (%s) \033[K\033[0m\n" "$IFACE"
+            printf "${POS} 速度: ⬇ %-7s ⬆ %-7s\n" "$RX_S" "$TX_S"
+            printf "${POS} 流量: ⬇ %-7s ⬆ %-7s\n" "$RX_TOT" "$TX_TOT"
+            printf "${POS} IPv4: ${COLOR_TERM_HIGH}%s${COLOR_RESET}\n" "$SAFE_IPV4"
+            if [ "$IPV6" != "无" ] && [ -n "$IPV6" ] && [ "$IPV6" != "探测中..." ]; then
+                printf "${POS} IPv6: ${COLOR_TERM_HIGH}%.21s${COLOR_RESET}\n" "$SAFE_IPV6"
+            fi
+            printf "${POS} 地区: %s\n" "$IP_CITY"
+            printf "${POS} ISP : %s\n" "$IP_ORG"
+            printf "${POS} DNS : ${COLOR_TERM_HIGH}%s${COLOR_RESET}\n" "$SAFE_DNS"
+        )
+    else
+        # ==========================================
+        # 💻 桌面端右侧刚性吸附模式 (总宽 >= 70)
+        # ==========================================
+        PANEL_WIDTH=30
+        
+        if [ "$IN_TMUX" -eq 1 ]; then
+            if [ "$CUR_PANE_W" -ne "$PANEL_WIDTH" ]; then
+                tmux resize-pane -t "$TMUX_PANE" -x "$PANEL_WIDTH" 2>/dev/null
+            fi
+            START_COL=1
+        else
+            START_COL=$((GLOBAL_WIDTH - PANEL_WIDTH + 1))
+            [ "$START_COL" -lt 1 ] && START_COL=1
+        fi
+        
+        POS="\033[2K\033[${START_COL}G"
+        BAR_WIDTH=20
+        
+        BAR_CPU=$(draw_bar "$CPU_USE" "$BAR_WIDTH")
+        BAR_MEM=$(draw_bar "$MEM_PCT" "$BAR_WIDTH")
+        BAR_DISK=$(draw_bar "$DISK_PCT" "$BAR_WIDTH")
+        TOP_PROCS=$(echo "$RAW_PROCS" | awk -v col="$START_COL" '{printf "\033[2K\033[%dG %-5.1f  %-5.1f  %.11s\n", col, $1, $2, $3}')
+        
+        BUFFER=$(
+            printf "\033[H"
+            printf "${POS}\033[1;37;44m 系统信息                         \033[0m\n"
+            printf "${POS} 系统: %.20s\n" "$OS_INFO"
+            printf "${POS} 时间: %s\n" "$CURRENT_TIME"
+            printf "${POS} 运行: %s天 %s小时 %s分钟\n" "$D" "$H" "$M"
+            printf "${POS} 负载: %s %s %s\n" "$LOAD1" "$LOAD5" "$LOAD15"
+            printf "${POS} CPU : %s核 %.16s\n" "$CORES" "$CPU_MODEL"
+            printf "${POS} %s %5s%%\n" "$BAR_CPU" "${CPU_USE}"
+            printf "${POS} 内存: %-12s\n" "$MEM_STR"
+            printf "${POS} %s %5s%%\n" "$BAR_MEM" "${MEM_PCT}"
+            printf "${POS} 磁盘: %-12s\n" "$DISK_STR"
+            printf "${POS} %s %5s%%\n" "$BAR_DISK" "${DISK_PCT}"
+            printf "${POS} 读: %-8s| 写: %-8s\n" "$D_R_S" "$D_W_S"
+            printf "${POS}\n"
+            
+            printf "${POS}\033[1;37;44m 进程信息                         \033[0m\n"
+            printf "%s\n" "$TOP_PROCS"
+            printf "${POS}\n"
+            
+            printf "${POS}\033[1;37;44m 网络 (%s) \033[K\033[0m\n" "$IFACE"
+            printf "${POS} 速度: ⬇ %-7s ⬆ %-7s\n" "$RX_S" "$TX_S"
+            printf "${POS} 流量: ⬇ %-7s ⬆ %-7s\n" "$RX_TOT" "$TX_TOT"
+            printf "${POS} IPv4: ${COLOR_TERM_HIGH}%s${COLOR_RESET}\n" "$SAFE_IPV4"
+            if [ "$IPV6" != "无" ] && [ -n "$IPV6" ] && [ "$IPV6" != "探测中..." ]; then
+                printf "${POS} IPv6: ${COLOR_TERM_HIGH}%.21s${COLOR_RESET}\n" "$SAFE_IPV6"
+            fi
+            printf "${POS} 地区: %s\n" "$IP_CITY"
+            printf "${POS} ISP : %s\n" "$IP_ORG"
+            printf "${POS} DNS : ${COLOR_TERM_HIGH}%s${COLOR_RESET}\n" "$SAFE_DNS"
+        )
+    fi
+    
+    printf "%s\033[J" "$BUFFER"
+    
+    for i in {1..10}; do
+        if [ "$RESIZE_EVENT" = "1" ]; then
+            RESIZE_EVENT=0
+            printf "\033[2J\033[H"
+            break
+        fi
+        sleep 0.2
+    done
+done
+EOF
+chmod +x /usr/local/bin/nano-mon
+
+cat << 'EOF' > /usr/local/bin/dash
+#!/bin/bash
+tmux kill-session -t dash 2>/dev/null
+sleep 0.2
+tmux new-session -d -s dash
+_TMUX_VER=$(tmux -V 2>/dev/null | awk '{print $2}' | tr -d '[:alpha:]')
+if awk "BEGIN{exit !($_TMUX_VER+0 >= 2.1)}"; then
+    tmux set-option -t dash mouse on
+else
+    tmux set-option -t dash mode-mouse on
+    tmux set-option -t dash mouse-resize-pane on
+    tmux set-option -t dash mouse-select-pane on
+    tmux set-option -t dash mouse-select-window on
+fi
+tmux split-window -h -p 30 -t dash:0.0
+_WIN_H=$(tmux display-message -p '#{window_height}' 2>/dev/null || echo 40)
+_FB_H=$(( _WIN_H / 3 ))
+[ $_FB_H -gt 14 ] && _FB_H=14
+[ $_FB_H -lt 5 ] && _FB_H=5
+tmux split-window -v -l $_FB_H -t dash:0.0
+tmux send-keys -t dash:0.2 'nano-mon' C-m
+tmux send-keys -t dash:0.1 'nano-fb' C-m
+tmux select-pane -t dash:0.0
+tmux attach-session -t dash
+EOF
+chmod +x /usr/local/bin/dash
+
+cat << 'FBEOF' > /usr/local/bin/nano-fb
+#!/bin/bash
+# nano-fb - 双栏文件浏览器
+
+printf '\033[?25l'
+trap 'printf "\033[?25h\033[0m\033[2J\033[H"; printf "\033[?1006l\033[?1000l"; exit' INT TERM EXIT
+
+get_left_entries() {
+    mapfile -t LEFT_ENTRIES < <(
+        ls -1 / 2>/dev/null | while read -r name; do
+            [ -d "/$name" ] && echo "$name"
+        done
+    )
+}
+
+get_right_entries() {
+    mapfile -t RIGHT_ENTRIES < <(
+        (cd "$RIGHT_DIR" 2>/dev/null && ls -1a --group-directories-first 2>/dev/null) | grep -v '^\.$'
+    )
+}
+
+draw() {
+    local rows cols
+    # 动态计算目标高度：1/3 窗口高度，上限14行
+    if [ -n "$TMUX" ] && [ -n "$TMUX_PANE" ]; then
+        local win_h
+        win_h=$(tmux display-message -p '#{window_height}' 2>/dev/null || echo 40)
+        local target_h=$(( win_h / 3 ))
+        [ $target_h -gt 14 ] && target_h=14
+        [ $target_h -lt 5 ] && target_h=5
+        tmux resize-pane -t "$TMUX_PANE" -y $target_h 2>/dev/null
+    fi
+    rows=$(tput lines)
+    cols=$(tput cols)
+    local visible=$((rows - 2))
+    [ $visible -gt 12 ] && visible=12
+    local left_w=$(( cols * 30 / 100 ))
+    local right_w=$(( cols - left_w - 1 ))
+
+    local ltotal=${#LEFT_ENTRIES[@]}
+    [ $LEFT_SEL -ge $ltotal ] && LEFT_SEL=$((ltotal - 1))
+    [ $LEFT_SEL -lt 0 ] && LEFT_SEL=0
+    [ $LEFT_SEL -lt $LEFT_OFFSET ] && LEFT_OFFSET=$LEFT_SEL
+    [ $LEFT_SEL -ge $((LEFT_OFFSET + visible)) ] && LEFT_OFFSET=$((LEFT_SEL - visible + 1))
+
+    local rtotal=${#RIGHT_ENTRIES[@]}
+    [ $RIGHT_SEL -ge $rtotal ] && RIGHT_SEL=$((rtotal - 1))
+    [ $RIGHT_SEL -lt 0 ] && RIGHT_SEL=0
+    [ $RIGHT_SEL -lt $RIGHT_OFFSET ] && RIGHT_OFFSET=$RIGHT_SEL
+    [ $RIGHT_SEL -ge $((RIGHT_OFFSET + visible)) ] && RIGHT_OFFSET=$((RIGHT_SEL - visible + 1))
+
+    # 地址栏
+    printf '\033[H\033[48;5;24m\033[97m'
+    printf ' %-*s' $((cols - 1)) "$RIGHT_DIR"
+    printf '\033[0m'
+
+    for ((i=0; i<visible; i++)); do
+        printf '\033[%d;1H' $((i + 2))
+
+        # 左栏
+        local lidx=$((i + LEFT_OFFSET))
+        if [ $lidx -lt $ltotal ]; then
+            local lname="${LEFT_ENTRIES[$lidx]}"
+            if [ $lidx -eq $LEFT_SEL ] && [ $FOCUS -eq 0 ]; then
+                printf '\033[48;5;33m\033[97m'
+            elif [ $lidx -eq $LEFT_SEL ]; then
+                printf '\033[48;5;238m\033[37m'
+            else
+                printf '\033[0m'
+            fi
+            printf ' %-*s\033[0m' $((left_w - 1)) "/$lname"
+        else
+            printf '\033[0m%-*s' $left_w ""
+        fi
+
+        # 分隔线
+        printf '\033[48;5;240m\033[37m│\033[0m'
+
+        # 右栏
+        local ridx=$((i + RIGHT_OFFSET))
+        if [ $ridx -lt $rtotal ]; then
+            local rname="${RIGHT_ENTRIES[$ridx]}"
+            local rfullpath="$RIGHT_DIR/$rname"
+            local rprefix=' '
+            [ -d "$rfullpath" ] && rprefix='/'
+            if [ $ridx -eq $RIGHT_SEL ] && [ $FOCUS -eq 1 ]; then
+                printf '\033[48;5;33m\033[97m'
+            elif [ $ridx -eq $RIGHT_SEL ]; then
+                printf '\033[48;5;238m\033[37m'
+            else
+                printf '\033[0m'
+            fi
+            printf ' %-*s\033[0m' $((right_w - 1)) "${rprefix}${rname}"
+        else
+            printf '\033[0m%-*s' $right_w ""
+        fi
+    done
+
+    local status="Tab:切换焦点  Enter:进入/打开  Backspace:返回  /:跳转  q:退出"
+    printf '\033[%d;1H\033[48;5;236m\033[37m %-*s\033[0m' $((rows)) $((cols - 1)) "$status"
+}
+
+open_right() {
+    local name="${RIGHT_ENTRIES[$RIGHT_SEL]}"
+    [ -z "$name" ] && return
+    local fullpath="$RIGHT_DIR/$name"
+    if [ -d "$fullpath" ]; then
+        RIGHT_DIR=$(realpath "$fullpath")
+        RIGHT_SEL=0; RIGHT_OFFSET=0
+        get_right_entries
+    elif [ -f "$fullpath" ]; then
+        if [ -n "$TMUX" ]; then
+            local pane_pid
+            pane_pid=$(tmux display-message -t dash:0.0 -p '#{pane_pid}')
+            pkill -P "$pane_pid" nano 2>/dev/null
+            sleep 0.15
+            tmux send-keys -t dash:0.0 "nano '$fullpath'" C-m
+        else
+            nano "$fullpath"
+        fi
+    fi
+}
+
+go_right_up() {
+    local parent prev
+    parent=$(dirname "$RIGHT_DIR")
+    [ "$parent" = "$RIGHT_DIR" ] && return
+    prev=$(basename "$RIGHT_DIR")
+    RIGHT_DIR="$parent"
+    RIGHT_SEL=0; RIGHT_OFFSET=0
+    get_right_entries
+    for ((i=0; i<${#RIGHT_ENTRIES[@]}; i++)); do
+        [ "${RIGHT_ENTRIES[$i]}" = "$prev" ] && RIGHT_SEL=$i && break
+    done
+}
+
+select_left() {
+    local name="${LEFT_ENTRIES[$LEFT_SEL]}"
+    RIGHT_DIR="/$name"
+    RIGHT_SEL=0; RIGHT_OFFSET=0
+    get_right_entries
+}
+
+jump_to() {
+    local rows cols ch k2 k3 input
+    rows=$(tput lines); cols=$(tput cols)
+    printf '\033[?1006l\033[?1000l'
+    input="$RIGHT_DIR"
+    while true; do
+        printf '\033[H\033[48;5;24m\033[97m'
+        printf ' %-*s' $((cols - 1)) ""
+        printf '\033[H\033[48;5;24m\033[97m 跳转: %s\033[?25h' "$input"
+        IFS= read -r -s -n1 ch
+        if [[ $ch == $'\033' ]]; then
+            IFS= read -r -s -n1 -t 0.15 k2
+            if [[ -z $k2 ]]; then
+                # 单独 ESC，取消
+                break
+            fi
+            IFS= read -r -s -n1 -t 0.15 k3
+            continue
+        elif [[ $ch == $'\r' || $ch == '' ]]; then
+            if [ -n "$input" ] && [ -d "$input" ]; then
+                RIGHT_DIR=$(realpath "$input")
+                RIGHT_SEL=0; RIGHT_OFFSET=0
+                get_right_entries
+            fi
+            break
+        elif [[ $ch == $'\177' || $ch == $'\010' ]]; then
+            [ ${#input} -gt 0 ] && input="${input%?}"
+        else
+            input+="$ch"
+        fi
+    done
+    printf '\033[?25l'
+    printf '\033[?1000h\033[?1006h'
+}
+
+# 初始化
+LEFT_SEL=0; LEFT_OFFSET=0
+RIGHT_SEL=0; RIGHT_OFFSET=0
+FOCUS=1
+LAST_CLICK_TIME=0; LAST_CLICK_IDX=-1; LAST_CLICK_PANE=-1
+
+get_left_entries
+RIGHT_DIR="/${LEFT_ENTRIES[0]:-root}"
+[ ! -d "$RIGHT_DIR" ] && RIGHT_DIR="/root"
+get_right_entries
+
+# 等待 tmux 完成 pane resize
+sleep 0.5
+
+printf '\033[?1000h\033[?1006h'
+
+# 监听窗口大小变化信号，强制重绘
+_NEED_REDRAW=1
+_RESIZE_EVENT=0
+_prev_rows=0; _prev_cols=0
+trap '_RESIZE_EVENT=1; _NEED_REDRAW=1' WINCH
+
+while true; do
+    rows=$(tput lines)
+    visible=$((rows - 2))
+    cols=$(tput cols)
+    left_w=$(( cols * 30 / 100 ))
+
+    if [ $_NEED_REDRAW -eq 1 ]; then
+        _NEED_REDRAW=0
+        printf '\033[2J'
+        draw
+    fi
+
+    IFS= read -r -s -n1 -t 0.3 key; _read_rc=$?
+    # 检测终端尺寸变化，自动重绘
+    _new_rows=$(tput lines); _new_cols=$(tput cols)
+    if [ "$_new_rows" != "$_prev_rows" ] || [ "$_new_cols" != "$_prev_cols" ]; then
+        _prev_rows=$_new_rows; _prev_cols=$_new_cols
+        _NEED_REDRAW=1
+    fi
+    if [[ $key == $'\033' ]]; then
+        IFS= read -r -s -n1 -t 0.05 k2
+        if [[ $k2 == '[' ]]; then
+            IFS= read -r -s -n1 -t 0.05 k3
+            case $k3 in
+                A)  # 上
+                    if [ $FOCUS -eq 0 ]; then
+                        ((LEFT_SEL > 0)) && { ((LEFT_SEL--)); select_left; }
+                    else
+                        ((RIGHT_SEL > 0)) && ((RIGHT_SEL--))
+                    fi
+                    draw; continue;;
+                B)  # 下
+                    if [ $FOCUS -eq 0 ]; then
+                        ((LEFT_SEL < ${#LEFT_ENTRIES[@]} - 1)) && { ((LEFT_SEL++)); select_left; }
+                    else
+                        ((RIGHT_SEL < ${#RIGHT_ENTRIES[@]} - 1)) && ((RIGHT_SEL++))
+                    fi
+                    draw; continue;;
+                C)  # 右箭头切换到右栏
+                    FOCUS=1; draw; continue;;
+                D)  # 左箭头切换到左栏
+                    FOCUS=0; draw; continue;;
+                '<')  # SGR 鼠标
+                    mouse_seq=""
+                    while IFS= read -r -s -n1 -t 0.1 mc; do
+                        mouse_seq+="$mc"
+                        [[ $mc == 'M' || $mc == 'm' ]] && break
+                    done
+                    # 忽略释放事件（m结尾），只处理按下事件（M结尾）
+                    [[ $mouse_seq == *m ]] && continue
+                    IFS=';' read -r mbtn mmx mmy_raw <<< "${mouse_seq%[Mm]}"
+                    mmy="${mmy_raw%[Mm]}"
+                    btn=$((mbtn + 0)); mx=$((mmx + 0)); my=$((mmy + 0))
+
+                    # 滚轮
+                    if [ $btn -eq 64 ]; then
+                        if [ $mx -le $left_w ]; then
+                            FOCUS=0
+                            ((LEFT_SEL > 0)) && { ((LEFT_SEL--)); select_left; }
+                        else
+                            FOCUS=1
+                            ((RIGHT_SEL > 0)) && ((RIGHT_SEL--))
+                        fi
+                        draw; continue
+                    elif [ $btn -eq 65 ]; then
+                        if [ $mx -le $left_w ]; then
+                            FOCUS=0
+                            ((LEFT_SEL < ${#LEFT_ENTRIES[@]} - 1)) && { ((LEFT_SEL++)); select_left; }
+                        else
+                            FOCUS=1
+                            ((RIGHT_SEL < ${#RIGHT_ENTRIES[@]} - 1)) && ((RIGHT_SEL++))
+                        fi
+                        draw; continue
+                    fi
+
+                    # 只处理左键按下
+                    [ $btn -ne 0 ] && draw && continue
+
+                    # 点击地址栏
+                    if [ $my -eq 1 ]; then
+                        jump_to; draw; continue
+                    fi
+
+                    row=$((my - 2))
+                    now=$(date +%s%3N)
+
+                    if [ $mx -le $left_w ]; then
+                        # 点击左栏
+                        click_idx=$((row + LEFT_OFFSET))
+                        if [ $click_idx -ge 0 ] && [ $click_idx -lt ${#LEFT_ENTRIES[@]} ]; then
+                            FOCUS=0
+                            LEFT_SEL=$click_idx
+                            select_left
+                            LAST_CLICK_IDX=$click_idx; LAST_CLICK_PANE=0; LAST_CLICK_TIME=$now
+                        fi
+                    else
+                        # 点击右栏
+                        click_idx=$((row + RIGHT_OFFSET))
+                        if [ $click_idx -ge 0 ] && [ $click_idx -lt ${#RIGHT_ENTRIES[@]} ]; then
+                            FOCUS=1
+                            _diff=$(( now - LAST_CLICK_TIME ))
+                            if [ $click_idx -eq $LAST_CLICK_IDX ] && [ $LAST_CLICK_PANE -eq 1 ] && [ $_diff -gt 0 ] && [ $_diff -lt 500 ]; then
+                                RIGHT_SEL=$click_idx
+                                open_right
+                                LAST_CLICK_IDX=-1; LAST_CLICK_TIME=0
+                            else
+                                RIGHT_SEL=$click_idx
+                                LAST_CLICK_IDX=$click_idx; LAST_CLICK_PANE=1; LAST_CLICK_TIME=$now
+                            fi
+                        fi
+                    fi
+                    draw; continue;;
+            esac
+        fi
+    fi
+
+    case $key in
+        '')
+            if [ $_read_rc -gt 128 ]; then
+                : # read 超时，不触发任何动作
+            elif [ $_RESIZE_EVENT -eq 1 ]; then
+                _RESIZE_EVENT=0
+                draw
+            elif [ $FOCUS -eq 0 ]; then
+                FOCUS=1
+                draw
+            else
+                open_right
+                draw
+            fi;;
+        $'\177'|$'\010')
+            [ $FOCUS -eq 1 ] && go_right_up
+            draw;;
+        /|g|G)  jump_to; draw;;
+        $'\t')  FOCUS=$(( 1 - FOCUS )); draw;;
+        q|Q)  exit 0;;
+    esac
+done
+FBEOF
+chmod +x /usr/local/bin/nano-fb
+echo "V0.2 个人轻量监控面板 部署完毕！"
+}
