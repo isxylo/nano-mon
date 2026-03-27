@@ -699,5 +699,5 @@ while true; do
 done
 FBEOF
 chmod +x /usr/local/bin/nano-fb
-echo "V0.2 个人轻量监控面板 部署完毕！"
+echo "V0.2 轻量监控、文件浏览面板 部署完毕！"
 }
