@@ -1,0 +1,346 @@
+{
+# 依赖检测与自动安装
+_install_pkg() {
+    # $1=命令名 $2=apt包名 $3=yum/dnf包名
+    local cmd="$1" apt_pkg="$2" rpm_pkg="$3"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get install -y -q "$apt_pkg"
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q "$rpm_pkg"
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q "$rpm_pkg"
+    else
+        echo "错误：无法识别包管理器，请手动安装 $cmd"; exit 1
+    fi
+}
+# 格式: "命令|apt包名|yum/dnf包名"
+_DEPS="curl|curl|curl
+tmux|tmux|tmux
+free|procps|procps-ng
+ps|procps|procps-ng
+ip|iproute2|iproute
+tput|ncurses-bin|ncurses"
+while IFS='|' read -r _cmd _apt _rpm; do
+    [ -z "$_cmd" ] && continue
+    if ! command -v "$_cmd" >/dev/null 2>&1; then
+        echo "检测到 $_cmd 未安装，正在安装..."
+        _install_pkg "$_cmd" "$_apt" "$_rpm"
+        echo "$_cmd 安装完成"
+    else
+        echo "$_cmd 已安装，跳过"
+    fi
+done <<< "$_DEPS"
+unset _cmd _apt _rpm _DEPS _install_pkg
+
+cat << 'EOF' > /usr/local/bin/nano-mon
+#!/bin/bash
+# 隐藏光标，绝对禁绝换行
+printf "\033[?25l\033[?7l"
+trap 'printf "\033[?25h\033[?7h\033[0m\033[2J\033[H"; exit' INT TERM EXIT
+
+# UTF-8 编码检查
+if [[ "$LANG$LC_ALL$LC_CTYPE" != *UTF-8* ]] && [[ "$LANG$LC_ALL$LC_CTYPE" != *utf8* ]]; then
+    printf "\033[?25h\033[?7h\033[0m\n警告：终端编码非 UTF-8，进度条等字符可能显示乱码。\n建议执行：export LANG=en_US.UTF-8\n按 Enter 继续..."
+    read -r -t 5
+fi
+
+# ⚡️ 监听窗口拖拽信号
+RESIZE_EVENT=0
+trap 'RESIZE_EVENT=1' WINCH
+
+# 强力清场：开局直接干掉所有历史乱码文件
+rm -f /tmp/.nano_mon_ip /tmp/.nano_mon_last_ip_fetch /tmp/.nano_mon_ip.tmp
+
+IFACE=$(ip route 2>/dev/null | grep default | awk '{print $5}' | head -n1)
+[ -z "$IFACE" ] && IFACE=$(ip link show 2>/dev/null | awk -F': ' '/^[0-9]+: (e|w)/{print $2; exit}')
+[ -z "$IFACE" ] && { printf "\033[?25h\033[?7h\033[0m\n错误：无法检测到网卡，请检查网络配置。\n"; exit 1; }
+
+OS_INFO=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 | sed 's/ GNU\/Linux//g' | sed 's/ (.*)//g')
+[ -z "$OS_INFO" ] && OS_INFO="Linux"
+
+RX_PREV=$(cat /sys/class/net/$IFACE/statistics/rx_bytes 2>/dev/null || echo 0)
+TX_PREV=$(cat /sys/class/net/$IFACE/statistics/tx_bytes 2>/dev/null || echo 0)
+read cpu user nice system idle iowait irq softirq steal _ < /proc/stat
+PREV_IDLE=$((idle + iowait))
+PREV_TOTAL=$((user + nice + system + idle + iowait + irq + softirq + steal))
+
+CORES=$(nproc 2>/dev/null || echo 1)
+# ⚡️ 仅修改此处：精简 CPU 型号逻辑 (脱水版)
+CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed -r -e 's/\((R|TM)\)//g' -e 's/ [0-9]+-Core//' -e 's/ (Xeon|Gold|Platinum|Silver|Bronze|Scalable|Processor|CPU)//g' -e 's/ v[0-9]//g' -e 's/ @.*//g' -e 's/  */ /g' -e 's/^[ \t]*//' || echo "Unknown")
+
+DISK_DEV=$(awk '$3 ~ /^[hsv]d[a-z]$|^nvme[0-9]n[0-9]$/ {print $3; exit}' /proc/partitions)
+[ -n "$DISK_DEV" ] && read PREV_R_SEC PREV_W_SEC <<< $(awk -v dev="$DISK_DEV" '$3==dev {print $6, $10}' /proc/diskstats)
+PREV_R_SEC=${PREV_R_SEC:-0}
+PREV_W_SEC=${PREV_W_SEC:-0}
+
+draw_bar() {
+    awk -v p="$1" -v w="$2" 'BEGIN{
+        if(p>100) p=100; if(p<0) p=0;
+        slices = int((p * w * 8 / 100) + 0.5);
+        if(p>0 && slices==0) slices=1; 
+        
+        full = int(slices / 8);
+        rem = slices % 8;
+        empty = w - full - (rem>0 ? 1 : 0);
+        
+        if(p>80) color="\033[31m"; else if(p>50) color="\033[33m"; else color="\033[32m";
+        printf color;
+        for(i=0; i<full; i++) printf "█";
+        
+        if(rem==1) printf "▏"; else if(rem==2) printf "▎"; else if(rem==3) printf "▍"; 
+        else if(rem==4) printf "▌"; else if(rem==5) printf "▋"; else if(rem==6) printf "▊"; 
+        else if(rem==7) printf "▉";
+        
+        printf "\033[37m";
+        for(i=0; i<empty; i++) printf "░";
+        printf "\033[0m";
+    }'
+}
+
+while true; do
+    # --- 1. 后台数据异步采集区 ---
+    NOW=$(date +%s)
+    LAST_FETCH=$(cat /tmp/.nano_mon_last_ip_fetch 2>/dev/null || echo 0)
+    if [ $((NOW - LAST_FETCH)) -gt 300 ]; then
+        echo $NOW > /tmp/.nano_mon_last_ip_fetch
+        (
+            if ! command -v curl >/dev/null 2>&1; then
+                echo "curl未安装|无|未知|未知|未知" > /tmp/.nano_mon_ip
+                exit 0
+            fi
+            V4=$(curl -s -4 -m 3 ifconfig.me || curl -s -4 -m 3 ip.sb || echo "无")
+            [ -z "$V4" ] && V4="无"
+            V6=$(curl -s -6 -m 3 ifconfig.me || curl -s -6 -m 3 ip.sb || echo "无")
+            [ -z "$V6" ] && V6="无"
+            DNS=$(grep -i '^nameserver' /etc/resolv.conf | head -n1 | awk '{print $2}')
+            [ -z "$DNS" ] && DNS="未知"
+            GEO_DATA=$(curl -s -m 3 "http://ip-api.com/line/?lang=zh-CN&fields=country,regionName,isp" || echo -e "未知\n未知\n未知")
+            C_COUNTRY=$(echo "$GEO_DATA" | sed -n '1p')
+            C_REGION=$(echo "$GEO_DATA" | sed -n '2p')
+            C_ISP=$(echo "$GEO_DATA" | sed -n '3p')
+            [ -z "$C_COUNTRY" ] && C_COUNTRY="未知"
+            if [ "$C_COUNTRY" = "$C_REGION" ] || [ -z "$C_REGION" ]; then
+                CITY="$C_COUNTRY"
+            else
+                CITY="${C_COUNTRY} ${C_REGION}"
+            fi
+            ORG="${C_ISP:-未知}"
+            echo "${V4}|${V6}|${DNS}|${CITY}|${ORG}" > /tmp/.nano_mon_ip.tmp
+            mv /tmp/.nano_mon_ip.tmp /tmp/.nano_mon_ip
+        ) &
+    fi
+
+    if [ -f "/tmp/.nano_mon_ip" ]; then
+        IFS='|' read -r IPV4 IPV6 IP_DNS IP_CITY IP_ORG < /tmp/.nano_mon_ip
+    else
+        IPV4="探测中..."; IPV6="探测中..."; IP_DNS="..."; IP_CITY="..."; IP_ORG="..."
+    fi
+    
+    CURRENT_TIME=$(date +"%m-%d %H:%M:%S %Z")
+    SECS=$(cut -d. -f1 /proc/uptime)
+    D=$((SECS / 86400)); H=$(((SECS % 86400) / 3600)); M=$(((SECS % 3600) / 60))
+    read LOAD1 LOAD5 LOAD15 _ < /proc/loadavg
+    
+    read cpu user nice system idle iowait irq softirq steal _ < /proc/stat
+    IDLE=$((idle + iowait))
+    TOTAL=$((user + nice + system + idle + iowait + irq + softirq + steal))
+    DIFF_IDLE=$((IDLE - PREV_IDLE)); DIFF_TOTAL=$((TOTAL - PREV_TOTAL))
+    CPU_USE=$(awk -v id="$DIFF_IDLE" -v tot="$DIFF_TOTAL" 'BEGIN{if(tot==0) printf "0.0"; else printf "%.1f", 100*(tot-id)/tot}')
+    PREV_IDLE=$IDLE; PREV_TOTAL=$TOTAL
+    
+    read total used <<< $(free -m | awk 'NR==2{print $2, $3}')
+    MEM_TOT=$(awk -v t="$total" 'BEGIN{if(t>=1024) printf "%.1fG", t/1024; else printf "%dM", t}')
+    MEM_USED=$(awk -v u="$used" 'BEGIN{if(u>=1024) printf "%.1fG", u/1024; else printf "%dM", u}')
+    MEM_PCT=$(awk -v u="$used" -v t="$total" 'BEGIN{if(t>0) printf "%.1f", u*100/t; else print "0.0"}')
+    MEM_STR="${MEM_USED} / ${MEM_TOT}"
+    
+    read d_total d_used <<< $(df -k / | awk 'NR==2{print $2, $3}')
+    DISK_TOT=$(awk -v t="$d_total" 'BEGIN{if(t>=1048576) printf "%.1fG", t/1048576; else printf "%dM", t/1024}')
+    DISK_USED=$(awk -v u="$d_used" 'BEGIN{if(u>=1048576) printf "%.1fG", u/1048576; else printf "%dM", u/1024}')
+    DISK_PCT=$(awk -v u="$d_used" -v t="$d_total" 'BEGIN{if(t>0) printf "%.1f", u*100/t; else print "0.0"}')
+    DISK_STR="${DISK_USED} / ${DISK_TOT}"
+    
+    if [ -n "$DISK_DEV" ]; then
+        read r_sec w_sec <<< $(awk -v dev="$DISK_DEV" '$3==dev {print $6, $10}' /proc/diskstats)
+        r_sec=${r_sec:-$PREV_R_SEC}; w_sec=${w_sec:-$PREV_W_SEC}
+        R_BPS=$(awk -v r="$r_sec" -v rp="$PREV_R_SEC" 'BEGIN{printf "%.0f", (r-rp)*512/2}')
+        W_BPS=$(awk -v w="$w_sec" -v wp="$PREV_W_SEC" 'BEGIN{printf "%.0f", (w-wp)*512/2}')
+        PREV_R_SEC=$r_sec; PREV_W_SEC=$w_sec
+        read D_R_S D_W_S <<< $(awk -v r="$R_BPS" -v w="$W_BPS" '
+        function short_fmt(b) {
+            if(b>=1073741824) return sprintf("%.1fG", b/1073741824);
+            else if(b>=1048576) return sprintf("%.1fM", b/1048576);
+            else if(b>=1024) return sprintf("%.1fK", b/1024);
+            else return sprintf("%.0fB", b);
+        }
+        BEGIN{printf "%s/s %s/s", short_fmt(r), short_fmt(w)}')
+    else
+        D_R_S="0B/s"; D_W_S="0B/s"
+    fi
+    
+    RX=$(cat /sys/class/net/$IFACE/statistics/rx_bytes 2>/dev/null || echo 0)
+    TX=$(cat /sys/class/net/$IFACE/statistics/tx_bytes 2>/dev/null || echo 0)
+    read RX_S TX_S RX_TOT TX_TOT <<< $(awk -v r="$RX" -v rp="$RX_PREV" -v t="$TX" -v tp="$TX_PREV" '
+    function short_fmt(b) {
+        if(b>=1099511627776) return sprintf("%.2fT", b/1099511627776);
+        else if(b>=1073741824) return sprintf("%.1fG", b/1073741824);
+        else if(b>=1048576) return sprintf("%.1fM", b/1048576);
+        else if(b>=1024) return sprintf("%.1fK", b/1024);
+        else return sprintf("%.0fB", b);
+    }
+    BEGIN {
+        rb=(r-rp)/2; if(rb<0) rb=0;
+        tb=(t-tp)/2; if(tb<0) tb=0;
+        printf "%s/s %s/s %s %s", short_fmt(rb), short_fmt(tb), short_fmt(r), short_fmt(t)
+    }')
+    RX_PREV=$RX; TX_PREV=$TX
+
+    COLOR_TERM_HIGH="\033[38;2;238;0;100m"
+    COLOR_RESET="\033[0m"
+    SAFE_IPV4="$IPV4"; SAFE_IPV6="$IPV6"; SAFE_DNS="$IP_DNS"
+
+    RAW_PROCS=$(ps -eo pmem,pcpu,comm --sort=-pcpu | awk 'NR>1 {print $1, $2, $3}' | head -n 3)
+
+    # ⚡️ 检测是否在 Tmux 环境中 ⚡️
+    IN_TMUX=0
+    [ -n "$TMUX" ] && [ -n "$TMUX_PANE" ] && command -v tmux >/dev/null 2>&1 && IN_TMUX=1
+
+    # --- 2. 核心渲染与绿线控制区 ---
+    if [ "$IN_TMUX" -eq 1 ]; then
+        GLOBAL_WIDTH=$(tmux display-message -p '#{window_width}' 2>/dev/null || echo 80)
+        CUR_PANE_W=$(tmux display-message -p '#{pane_width}' 2>/dev/null || echo 30)
+    else
+        GLOBAL_WIDTH=$(tput cols 2>/dev/null || echo 80)
+        CUR_PANE_W=$GLOBAL_WIDTH
+    fi
+
+    if [ "$GLOBAL_WIDTH" -lt 70 ]; then
+        # ==========================================
+        # 📱 移动端精简模式 (总宽 < 70)
+        # ==========================================
+        BAR_WIDTH=$((CUR_PANE_W - 14))
+        [ "$BAR_WIDTH" -gt 30 ] && BAR_WIDTH=30 
+        [ "$BAR_WIDTH" -lt 5 ] && BAR_WIDTH=5
+        
+        POS="\033[2K\r"
+        
+        BAR_CPU=$(draw_bar "$CPU_USE" "$BAR_WIDTH")
+        BAR_MEM=$(draw_bar "$MEM_PCT" "$BAR_WIDTH")
+        BAR_DISK=$(draw_bar "$DISK_PCT" "$BAR_WIDTH")
+        TOP_PROCS=$(echo "$RAW_PROCS" | awk '{printf "\033[2K\r %-5.1f  %-5.1f  %.11s\n", $1, $2, $3}')
+        
+        BUFFER=$(
+            printf "\033[H"
+            printf "${POS}\033[1;37;44m 系统信息 \033[K\033[0m\n"
+            printf "${POS} OS: %.22s\n" "$OS_INFO"
+            printf "${POS} 时间: %s\n" "$CURRENT_TIME"
+            printf "${POS} 运行: %s天 %s时 %s分\n" "$D" "$H" "$M"
+            printf "${POS} 负载: %s %s %s\n" "$LOAD1" "$LOAD5" "$LOAD15"
+            printf "${POS} CPU : %s核 %.16s\n" "$CORES" "$CPU_MODEL"
+            printf "${POS} %s %5s%%\n" "$BAR_CPU" "${CPU_USE}"
+            printf "${POS} 内存: %-12s\n" "$MEM_STR"
+            printf "${POS} %s %5s%%\n" "$BAR_MEM" "${MEM_PCT}"
+            printf "${POS} 磁盘: %-12s\n" "$DISK_STR"
+            printf "${POS} %s %5s%%\n" "$BAR_DISK" "${DISK_PCT}"
+            printf "${POS} 读: %-8s| 写: %-8s\n" "$D_R_S" "$D_W_S"
+            printf "${POS}\n"
+            
+            printf "${POS}\033[1;37;44m 进程信息 \033[K\033[0m\n"
+            printf "%s\n" "$TOP_PROCS"
+            printf "${POS}\n"
+            
+            printf "${POS}\033[1;37;44m 网络 (%s) \033[K\033[0m\n" "$IFACE"
+            printf "${POS} 速度: ⬇ %-7s ⬆ %-7s\n" "$RX_S" "$TX_S"
+            printf "${POS} 流量: ⬇ %-7s ⬆ %-7s\n" "$RX_TOT" "$TX_TOT"
+            printf "${POS} IPv4: ${COLOR_TERM_HIGH}%s${COLOR_RESET}\n" "$SAFE_IPV4"
+            if [ "$IPV6" != "无" ] && [ -n "$IPV6" ] && [ "$IPV6" != "探测中..." ]; then
+                printf "${POS} IPv6: ${COLOR_TERM_HIGH}%.21s${COLOR_RESET}\n" "$SAFE_IPV6"
+            fi
+            printf "${POS} 地区: %s\n" "$IP_CITY"
+            printf "${POS} ISP : %s\n" "$IP_ORG"
+            printf "${POS} DNS : ${COLOR_TERM_HIGH}%s${COLOR_RESET}\n" "$SAFE_DNS"
+        )
+    else
+        # ==========================================
+        # 💻 桌面端右侧刚性吸附模式 (总宽 >= 70)
+        # ==========================================
+        PANEL_WIDTH=30
+        
+        if [ "$IN_TMUX" -eq 1 ]; then
+            if [ "$CUR_PANE_W" -ne "$PANEL_WIDTH" ]; then
+                tmux resize-pane -t "$TMUX_PANE" -x "$PANEL_WIDTH" 2>/dev/null
+            fi
+            START_COL=1
+        else
+            START_COL=$((GLOBAL_WIDTH - PANEL_WIDTH + 1))
+            [ "$START_COL" -lt 1 ] && START_COL=1
+        fi
+        
+        POS="\033[2K\033[${START_COL}G"
+        BAR_WIDTH=20
+        
+        BAR_CPU=$(draw_bar "$CPU_USE" "$BAR_WIDTH")
+        BAR_MEM=$(draw_bar "$MEM_PCT" "$BAR_WIDTH")
+        BAR_DISK=$(draw_bar "$DISK_PCT" "$BAR_WIDTH")
+        TOP_PROCS=$(echo "$RAW_PROCS" | awk -v col="$START_COL" '{printf "\033[2K\033[%dG %-5.1f  %-5.1f  %.11s\n", col, $1, $2, $3}')
+        
+        BUFFER=$(
+            printf "\033[H"
+            printf "${POS}\033[1;37;44m 系统信息                         \033[0m\n"
+            printf "${POS} 系统: %.20s\n" "$OS_INFO"
+            printf "${POS} 时间: %s\n" "$CURRENT_TIME"
+            printf "${POS} 运行: %s天 %s小时 %s分钟\n" "$D" "$H" "$M"
+            printf "${POS} 负载: %s %s %s\n" "$LOAD1" "$LOAD5" "$LOAD15"
+            printf "${POS} CPU : %s核 %.16s\n" "$CORES" "$CPU_MODEL"
+            printf "${POS} %s %5s%%\n" "$BAR_CPU" "${CPU_USE}"
+            printf "${POS} 内存: %-12s\n" "$MEM_STR"
+            printf "${POS} %s %5s%%\n" "$BAR_MEM" "${MEM_PCT}"
+            printf "${POS} 磁盘: %-12s\n" "$DISK_STR"
+            printf "${POS} %s %5s%%\n" "$BAR_DISK" "${DISK_PCT}"
+            printf "${POS} 读: %-8s| 写: %-8s\n" "$D_R_S" "$D_W_S"
+            printf "${POS}\n"
+            
+            printf "${POS}\033[1;37;44m 进程信息                         \033[0m\n"
+            printf "%s\n" "$TOP_PROCS"
+            printf "${POS}\n"
+            
+            printf "${POS}\033[1;37;44m 网络 (%s) \033[K\033[0m\n" "$IFACE"
+            printf "${POS} 速度: ⬇ %-7s ⬆ %-7s\n" "$RX_S" "$TX_S"
+            printf "${POS} 流量: ⬇ %-7s ⬆ %-7s\n" "$RX_TOT" "$TX_TOT"
+            printf "${POS} IPv4: ${COLOR_TERM_HIGH}%s${COLOR_RESET}\n" "$SAFE_IPV4"
+            if [ "$IPV6" != "无" ] && [ -n "$IPV6" ] && [ "$IPV6" != "探测中..." ]; then
+                printf "${POS} IPv6: ${COLOR_TERM_HIGH}%.21s${COLOR_RESET}\n" "$SAFE_IPV6"
+            fi
+            printf "${POS} 地区: %s\n" "$IP_CITY"
+            printf "${POS} ISP : %s\n" "$IP_ORG"
+            printf "${POS} DNS : ${COLOR_TERM_HIGH}%s${COLOR_RESET}\n" "$SAFE_DNS"
+        )
+    fi
+    
+    printf "%s\033[J" "$BUFFER"
+    
+    for i in {1..10}; do
+        if [ "$RESIZE_EVENT" = "1" ]; then
+            RESIZE_EVENT=0
+            printf "\033[2J\033[H"
+            break
+        fi
+        sleep 0.2
+    done
+done
+EOF
+chmod +x /usr/local/bin/nano-mon
+
+cat << 'EOF' > /usr/local/bin/dash
+#!/bin/bash
+tmux kill-session -t dash 2>/dev/null
+sleep 0.2
+tmux new-session -d -s dash
+tmux split-window -h -t dash
+tmux send-keys -t dash:0.1 "nano-mon" C-m
+tmux select-pane -t dash:0.0
+tmux attach-session -t dash
+EOF
+chmod +x /usr/local/bin/dash
+echo "V0.1 个人轻量监控面板 部署完毕！"
+}
